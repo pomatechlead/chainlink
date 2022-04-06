@@ -672,7 +672,9 @@ func (lsn *listenerV2) checkReqsFulfilled(ctx context.Context, l logger.Logger, 
 			return fulfilled, errors.Wrap(err, "creating getCommitment payload")
 		}
 
-		reqBlockNumber := new(big.Int).SetUint64(req.req.Raw.BlockNumber)
+		// Subtract 5 since the newest block likely isn't indexed yet and will cause "header not
+		// found" errors.
+		reqBlockNumber := new(big.Int).SetUint64(req.req.Raw.BlockNumber - 5)
 		currBlock := new(big.Int).SetUint64(lsn.getLatestHead())
 		m := bigmath.Max(reqBlockNumber, currBlock)
 
