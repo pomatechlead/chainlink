@@ -19,6 +19,7 @@ import (
 	"github.com/smartcontractkit/chainlink/core/assets"
 	"github.com/smartcontractkit/chainlink/core/chains"
 	evmclient "github.com/smartcontractkit/chainlink/core/chains/evm/client"
+	"github.com/smartcontractkit/chainlink/core/chains/evm/forwarders"
 	"github.com/smartcontractkit/chainlink/core/chains/evm/gas"
 	httypes "github.com/smartcontractkit/chainlink/core/chains/evm/headtracker/types"
 	"github.com/smartcontractkit/chainlink/core/chains/evm/label"
@@ -45,6 +46,7 @@ type Config interface {
 	EvmMaxInFlightTransactions() uint32
 	EvmMaxQueuedTransactions() uint64
 	EvmNonceAutoSync() bool
+	EvmUseForwarders() bool
 	EvmRPCDefaultBatchSize() uint32
 	KeySpecificMaxGasPriceWei(addr common.Address) *big.Int
 	TriggerFallbackDBPollInterval() time.Duration
@@ -99,8 +101,9 @@ type Txm struct {
 	chSubbed chan struct{}
 	wg       sync.WaitGroup
 
-	reaper      *Reaper
-	ethResender *EthResender
+	reaper        *Reaper
+	ethResender   *EthResender
+	forwardersMgr *forwarders.FwdMgr
 }
 
 func (b *Txm) RegisterResumeCallback(fn ResumeCallback) {
@@ -143,6 +146,11 @@ func NewTxm(db *sqlx.DB, ethClient evmclient.Client, cfg Config, keyStore KeySto
 		b.reaper = NewReaper(lggr, db, cfg, *ethClient.ChainID())
 	} else {
 		b.logger.Info("EthTxReaper: Disabled")
+	}
+	if cfg.EvmUseForwarders() {
+		b.forwardersMgr = forwarders.NewFwdMgr(db, b.config, b.chainID, b.logger)
+	} else {
+		b.logger.Info("EvmForwarders: Disabled")
 	}
 
 	return &b
@@ -300,6 +308,14 @@ type NewTx struct {
 // CreateEthTransaction inserts a new transaction
 func (b *Txm) CreateEthTransaction(newTx NewTx, qs ...pg.QOpt) (etx EthTx, err error) {
 	q := b.q.WithOpts(qs...)
+	if b.config.EvmUseForwarders() {
+		tx, err := b.MakeForwardedTransaction(newTx)
+		if err == nil {
+			newTx = tx
+		} else {
+			b.logger.Warnf("Skipping using forwarders: %s", err.Error())
+		}
+	}
 
 	err = CheckEthTxQueueCapacity(q, newTx.FromAddress, b.config.EvmMaxQueuedTransactions(), b.chainID)
 	if err != nil {
@@ -422,6 +438,18 @@ func signedTxHash(signedTx *gethTypes.Transaction, chainType chains.ChainType) (
 		hash = signedTx.Hash()
 	}
 	return hash, nil
+}
+
+func (b *Txm) MakeForwardedTransaction(tx NewTx) (NewTx, error) {
+	fwds, count, err := b.forwardersMgr.ORM.FindForwardersByChain(utils.Big(b.chainID))
+	if err != nil || count == 0 {
+		return tx, errors.Wrap(err, "Failed to retrieve forwarders")
+	}
+
+	tx.EncodedPayload = b.forwardersMgr.MakeForwardedPayload(tx.ToAddress, tx.EncodedPayload)
+	tx.ToAddress = fwds[0].Address
+
+	return tx, nil
 }
 
 // send broadcasts the transaction to the ethereum network, writes any relevant

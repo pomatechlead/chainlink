@@ -16,6 +16,7 @@ import (
 type ORM interface {
 	CreateForwarder(addr common.Address, evmChainId utils.Big) (fwd Forwarder, err error)
 	FindForwarders(offset, limit int) ([]Forwarder, int, error)
+	FindForwardersByChain(evmChainId utils.Big) ([]Forwarder, int, error)
 	DeleteForwarder(id int32) error
 }
 
@@ -62,6 +63,20 @@ func (o *orm) FindForwarders(offset, limit int) (fwds []Forwarder, count int, er
 
 	sql = `SELECT * FROM evm_forwarders ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2`
 	if err = o.q.Select(&fwds, sql, limit, offset); err != nil {
+		return
+	}
+	return
+}
+
+// FindForwardersByChain returns all forwarder addresses for a chain.
+func (o *orm) FindForwardersByChain(evmChainId utils.Big) (fwds []Forwarder, count int, err error) {
+	sql := `SELECT count(*) FROM evm_forwarders where evm_chain_id = $1`
+	if err = o.q.Get(&count, sql, evmChainId); err != nil {
+		return
+	}
+
+	sql = `SELECT * FROM evm_forwarders where evm_chain_id = $1 ORDER BY created_at DESC, id DESC LIMIT 10`
+	if err = o.q.Select(&fwds, sql, evmChainId); err != nil {
 		return
 	}
 	return
