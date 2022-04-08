@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
 	"math/big"
 	"sync"
 	"time"
@@ -53,6 +54,15 @@ const (
 	// BatchFulfillmentIterationGasCost is the cost of a single iteration of the batch coordinator's
 	// loop. This is used to determine the gas allowance for a batch fulfillment call.
 	BatchFulfillmentIterationGasCost = 52_000
+
+	// backoffInitialDelay is the initial delay to wait before retrying a failed request.
+	backoffInitialDelay = time.Minute
+
+	// backoffMaxDelay is the maximum amount of time to wait between retries.
+	backoffMaxDelay = time.Hour
+
+	// backoffFactor is the factor by which to increase the delay each time a request fails.
+	backoffFactor = 1.2
 )
 
 func newListenerV2(
@@ -106,6 +116,10 @@ type pendingRequest struct {
 	req              *vrf_coordinator_v2.VRFCoordinatorV2RandomWordsRequested
 	lb               log.Broadcast
 	utcTimestamp     time.Time
+
+	// used for exponential backoff when retrying
+	retryCount int
+	lastTry    time.Time
 }
 
 type vrfPipelineResult struct {
@@ -239,7 +253,7 @@ func (lsn *listenerV2) getAndRemoveConfirmedLogsBySub(latestHead uint64) map[uin
 	var toProcess = make(map[uint64][]pendingRequest)
 	var toKeep []pendingRequest
 	for i := 0; i < len(lsn.reqs); i++ {
-		if r := lsn.reqs[i]; r.confirmedAtBlock <= latestHead {
+		if r := lsn.reqs[i]; ready(r, latestHead) {
 			toProcess[r.req.SubId] = append(toProcess[r.req.SubId], r)
 		} else {
 			toKeep = append(toKeep, lsn.reqs[i])
@@ -247,6 +261,20 @@ func (lsn *listenerV2) getAndRemoveConfirmedLogsBySub(latestHead uint64) map[uin
 	}
 	lsn.reqs = toKeep
 	return toProcess
+}
+
+func ready(req pendingRequest, latestHead uint64) bool {
+	// Request is not eligible for fulfillment yet
+	if req.confirmedAtBlock > latestHead {
+		return false
+	}
+
+	expBackoffFactor := math.Pow(backoffFactor, float64(req.retryCount))
+	delay := backoffInitialDelay * time.Duration(expBackoffFactor)
+	if delay > backoffMaxDelay {
+		delay = backoffMaxDelay
+	}
+	return req.retryCount == 0 || time.Now().After(req.lastTry.Add(delay))
 }
 
 // Remove all entries 10000 blocks or older
@@ -292,6 +320,8 @@ func (lsn *listenerV2) processPendingVRFRequests(ctx context.Context) {
 		for _, subReqs := range confirmed {
 			for _, req := range subReqs {
 				if _, ok := processed[req.req.RequestId.String()]; !ok {
+					req.retryCount++
+					req.lastTry = time.Now()
 					toKeep = append(toKeep, req)
 				}
 			}
@@ -302,8 +332,9 @@ func (lsn *listenerV2) processPendingVRFRequests(ctx context.Context) {
 		lsn.reqs = append(lsn.reqs, toKeep...)
 		lsn.reqsMu.Unlock()
 		lsn.l.Infow("Finished processing pending requests",
-			"total processed", len(processed),
-			"total unprocessed", len(toKeep),
+			"totalProcessed", len(processed),
+			"totalFailed", len(toKeep),
+			"total", len(lsn.reqs),
 			"time", time.Since(start).String())
 	}()
 
@@ -311,7 +342,7 @@ func (lsn *listenerV2) processPendingVRFRequests(ctx context.Context) {
 	// Get subscription balance. Note that outside of this request handler, this can only decrease while there
 	// are no pending requests
 	if len(confirmed) == 0 {
-		lsn.l.Infow("No pending requests")
+		lsn.l.Infow("No pending requests ready for processing")
 		return
 	}
 	for subID, reqs := range confirmed {
@@ -410,7 +441,7 @@ func (lsn *listenerV2) processRequestsPerSubBatch(
 
 	l := lsn.l.With(
 		"subID", reqs[0].req.SubId,
-		"reqs", len(reqs),
+		"eligibleSubReqs", len(reqs),
 		"startBalance", startBalance.String(),
 		"startBalanceNoReservedLink", startBalanceNoReserveLink.String(),
 		"batchMaxGas", batchMaxGas,
@@ -419,9 +450,8 @@ func (lsn *listenerV2) processRequestsPerSubBatch(
 	defer func() {
 		l.Infow("Finished processing for sub",
 			"endBalance", startBalanceNoReserveLink.String(),
-			"total reqs", len(reqs),
-			"total processed", len(processed),
-			"total unique", uniqueReqs(reqs),
+			"totalProcessed", len(processed),
+			"totalUnique", uniqueReqs(reqs),
 			"time", time.Since(start).String())
 	}()
 
@@ -476,7 +506,8 @@ func (lsn *listenerV2) processRequestsPerSubBatch(
 				"fromAddress", fromAddress,
 				"juelsNeeded", p.juelsNeeded.String(),
 				"maxLink", p.maxLink.String(),
-				"gasLimit", p.gasLimit)
+				"gasLimit", p.gasLimit,
+				"retryCount", p.req.retryCount)
 
 			if p.err != nil {
 				ll.Errorw("Pipeline error", "err", p.err)
@@ -532,7 +563,7 @@ func (lsn *listenerV2) processRequestsPerSub(
 
 	l := lsn.l.With(
 		"subID", reqs[0].req.SubId,
-		"totalSubReqs", len(reqs),
+		"eligibleSubReqs", len(reqs),
 		"startBalance", startBalance.String(),
 		"startBalanceNoReservedLink", startBalanceNoReserveLink.String(),
 	)
@@ -540,9 +571,8 @@ func (lsn *listenerV2) processRequestsPerSub(
 	defer func() {
 		l.Infow("Finished processing for sub",
 			"endBalance", startBalanceNoReserveLink.String(),
-			"total reqs", len(reqs),
-			"total processed", len(processed),
-			"total unique", uniqueReqs(reqs),
+			"totalProcessed", len(processed),
+			"totalUnique", uniqueReqs(reqs),
 			"time", time.Since(start).String())
 	}()
 
@@ -594,7 +624,8 @@ func (lsn *listenerV2) processRequestsPerSub(
 				"fromAddress", fromAddress,
 				"juelsNeeded", p.juelsNeeded.String(),
 				"maxLink", p.maxLink.String(),
-				"gasLimit", p.gasLimit)
+				"gasLimit", p.gasLimit,
+				"retryCount", p.req.retryCount)
 
 			if p.err != nil {
 				ll.Errorw("Pipeline error", "err", p.err)
@@ -722,6 +753,7 @@ func (lsn *listenerV2) checkReqsFulfilled(ctx context.Context, l logger.Logger, 
 		if utils.IsEmpty(result) {
 			l.Infow("Request already fulfilled",
 				"reqID", reqs[i].req.RequestId.String(),
+				"retryCount", reqs[i].retryCount,
 				"txHash", reqs[i].req.Raw.TxHash)
 			fulfilled[i] = true
 		}
